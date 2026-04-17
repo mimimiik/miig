@@ -1,10 +1,10 @@
-// Файл 3: app.js — MIM Galaxy Ultimate · ПОЛНАЯ ЛОГИКА
+// app.js — MIM Galaxy Ultimate
 import * as webllm from '@mlc-ai/web-llm';
 
 // ---------- БАЗА ДАННЫХ ----------
 let db;
 const DB_NAME = 'mimGalaxyUltimate';
-const request = indexedDB.open(DB_NAME, 8);
+const request = indexedDB.open(DB_NAME, 12);
 request.onupgradeneeded = (e) => {
   db = e.target.result;
   if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages', { keyPath: 'chatId' });
@@ -12,6 +12,10 @@ request.onupgradeneeded = (e) => {
   if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
   if (!db.objectStoreNames.contains('users')) db.createObjectStore('users', { keyPath: 'username' });
   if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'id' });
+  if (!db.objectStoreNames.contains('groups')) db.createObjectStore('groups', { keyPath: 'id' });
+  if (!db.objectStoreNames.contains('channels')) db.createObjectStore('channels', { keyPath: 'id' });
+  if (!db.objectStoreNames.contains('drafts')) db.createObjectStore('drafts', { keyPath: 'chatId' });
+  if (!db.objectStoreNames.contains('blacklist')) db.createObjectStore('blacklist', { keyPath: 'username' });
 };
 request.onsuccess = (e) => { db = e.target.result; initApp(); };
 
@@ -20,13 +24,13 @@ window.socket = io();
 window.currentUser = null;
 window.currentChat = null;
 window.chats = [
-  { id: 'ai', name: 'MIM Ассистент', avatar: '🤖', type: 'ai', lastMsg: 'Привет! Я умный ИИ', time: '10:00' },
+  { id: 'ai', name: 'MIM Ассистент', avatar: '🤖', type: 'ai', lastMsg: 'Привет!', time: '10:00' },
   { id: 'friend1', name: 'Анна', avatar: 'А', type: 'user', lastMsg: 'Привет! Как дела?', time: '14:20' },
   { id: 'friend2', name: 'Кирилл', avatar: 'К', type: 'user', lastMsg: '🐾 Стикер', time: '27 мар' }
 ];
 window.contacts = [
-  { id: 'friend1', name: 'Анна', avatar: 'А', status: 'онлайн', online: true },
-  { id: 'friend2', name: 'Кирилл', avatar: 'К', status: 'был(а) недавно', online: false }
+  { id: 'friend1', name: 'Анна', avatar: 'А', online: true },
+  { id: 'friend2', name: 'Кирилл', avatar: 'К', online: false }
 ];
 window.ringtones = ['ringtone1.mp3', 'ringtone2.mp3', 'ringtone3.mp3'];
 window.messageSounds = ['message1.mp3', 'message2.mp3'];
@@ -39,8 +43,11 @@ let editingMessageId = null;
 let replyingTo = null;
 let localStream, peerConnection;
 const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+let currentLanguage = 'ru';
+let lockEnabled = false;
+let lockPIN = null;
 
-// Service Worker для PWA
+// Service Worker (PWA)
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(console.warn);
 }
@@ -73,16 +80,12 @@ socket.on('messageEdited', ({ chatId, messageId, newText }) => {
   }
 });
 socket.on('messageDeleted', ({ chatId, messageId }) => {
-  if (currentChat === chatId) {
-    document.querySelector(`.message-row[data-id="${messageId}"]`)?.remove();
-  }
+  if (currentChat === chatId) document.querySelector(`.message-row[data-id="${messageId}"]`)?.remove();
 });
 socket.on('reactionAdded', ({ chatId, messageId, reaction, user }) => {
   if (currentChat === chatId) {
     const reactDiv = document.querySelector(`.message-row[data-id="${messageId}"] .reactions`);
     if (reactDiv) {
-      const existing = reactDiv.querySelector(`[data-reaction="${reaction}"]`);
-      if (existing) existing.remove();
       const span = document.createElement('span');
       span.className = 'reaction';
       span.dataset.reaction = reaction;
@@ -97,15 +100,12 @@ socket.on('incomingCall', async ({ from, signal, video }) => {
     await setupCall(from, video, signal);
   }
 });
-socket.on('callAccepted', async (signal) => {
-  if (peerConnection) await peerConnection.setRemoteDescription(signal);
-});
-socket.on('iceCandidate', async (candidate) => {
-  if (peerConnection) await peerConnection.addIceCandidate(candidate);
-});
+socket.on('callAccepted', async (signal) => { if (peerConnection) await peerConnection.setRemoteDescription(signal); });
+socket.on('iceCandidate', async (candidate) => { if (peerConnection) await peerConnection.addIceCandidate(candidate); });
 
 // ---------- ИНИЦИАЛИЗАЦИЯ ----------
 function initApp() {
+  loadSettings();
   const tx = db.transaction('settings', 'readonly');
   tx.objectStore('settings').get('currentUser').onsuccess = (e) => {
     if (e.target.result) {
@@ -115,13 +115,12 @@ function initApp() {
       switchTab('chats');
       setTimeout(() => openChat('ai'), 50);
     } else {
-      // Исправлено: теперь показывает экран авторизации, а не splash
       document.getElementById('splashScreen').classList.remove('active');
       showScreen('authScreen');
     }
   };
-  loadSettings();
   startSplash();
+  applyLanguage();
 }
 
 function startSplash() {
@@ -160,6 +159,9 @@ function loadSettings() {
   };
   tx.objectStore('settings').get('accent').onsuccess = (e) => {
     if (e.target.result) document.documentElement.style.setProperty('--primary-gradient', `linear-gradient(135deg, ${e.target.result.value} 0%, #6D28D9 100%)`);
+  };
+  tx.objectStore('settings').get('fontSize').onsuccess = (e) => {
+    if (e.target.result) document.body.style.fontSize = e.target.result.value + 'px';
   };
 }
 
@@ -246,12 +248,12 @@ function renderChatsContent(cont) {
   cont.innerHTML = `
     <div class="content-header">
       <div class="avatar" style="width:40px;height:40px;" onclick="openProfile()">😎</div>
-      <h2>Чаты</h2>
+      <h2 data-i18n="chats">Чаты</h2>
       <i class="fas fa-search" onclick="searchMessages()"></i>
       <i class="fas fa-cog" onclick="openSettings()"></i>
     </div>
     <div class="list-container" id="chatList"></div>
-    <button class="fab" onclick="createGroup()"><i class="fas fa-users"></i></button>
+    <div class="fab" onclick="createGroup()"><i class="fas fa-users"></i></div>
   `;
   renderChats();
 }
@@ -267,7 +269,7 @@ function renderChats() {
 }
 function renderContactsContent(cont) {
   cont.innerHTML = `
-    <div class="content-header"><h2>Контакты</h2><i class="fas fa-user-plus" onclick="addContact()"></i><i class="fas fa-search" onclick="searchContacts()"></i></div>
+    <div class="content-header"><h2 data-i18n="contacts">Контакты</h2><i class="fas fa-user-plus" onclick="addContact()"></i><i class="fas fa-search" onclick="searchContacts()"></i></div>
     <div class="list-container" id="contactsList"></div>
   `;
   renderContacts();
@@ -284,7 +286,7 @@ function renderContacts() {
 }
 function renderToolsContent(cont) {
   cont.innerHTML = `
-    <div class="content-header"><h2>Инструменты</h2></div>
+    <div class="content-header"><h2 data-i18n="tools">Инструменты</h2></div>
     <div class="tools-grid">
       <div class="tool-card" onclick="openNotes()"><i class="fas fa-sticky-note"></i><br>Заметки</div>
       <div class="tool-card" onclick="openPaint()"><i class="fas fa-paint-brush"></i><br>Paint</div>
@@ -292,13 +294,11 @@ function renderToolsContent(cont) {
       <div class="tool-card" onclick="makeCall(false)"><i class="fas fa-phone-alt"></i><br>Аудиозвонок</div>
       <div class="tool-card" onclick="makeCall(true)"><i class="fas fa-video"></i><br>Видеозвонок</div>
       <div class="tool-card" onclick="startVideoCircle()"><i class="fas fa-circle"></i><br>Кружок</div>
-      <div class="tool-card" onclick="openCalculator()"><i class="fas fa-calculator"></i><br>Калькулятор</div>
-      <div class="tool-card" onclick="openWeather()"><i class="fas fa-cloud-sun"></i><br>Погода</div>
     </div>
   `;
 }
 
-// ---------- ЧАТЫ И СООБЩЕНИЯ ----------
+// ---------- ЧАТЫ ----------
 window.openChat = (id) => {
   currentChat = id;
   socket.emit('joinChat', id);
@@ -396,7 +396,7 @@ window.startVoiceRecord = async () => {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const recorder = RecordRTC(stream, { type: 'audio' });
   recorder.startRecording();
-  alert('Запись... Нажмите ОК для остановки');
+  alert('Запись... ОК для остановки');
   setTimeout(() => {
     recorder.stopRecording(() => {
       const blob = recorder.getBlob();
@@ -438,11 +438,7 @@ window.showMessageMenu = (e, msgId, sender) => {
   setTimeout(() => menu.remove(), 3000);
 };
 
-window.replyTo = (msgId) => {
-  replyingTo = msgId;
-  openChat(currentChat);
-};
-
+window.replyTo = (msgId) => { replyingTo = msgId; openChat(currentChat); };
 window.editMessage = (msgId) => {
   const msg = document.querySelector(`.message-bubble[data-id="${msgId}"]`);
   if (msg) {
@@ -450,19 +446,18 @@ window.editMessage = (msgId) => {
     editingMessageId = msgId;
   }
 };
-
 window.deleteMessage = (msgId, sender) => {
   if (sender !== currentUser && !confirm('Удалить сообщение?')) return;
   socket.emit('deleteMessage', { chatId: currentChat, messageId: msgId, forEveryone: sender === currentUser });
 };
-
 window.addReaction = (msgId, emoji) => {
   socket.emit('addReaction', { chatId: currentChat, messageId: msgId, reaction: emoji, user: currentUser });
 };
+window.cancelReply = () => { replyingTo = null; openChat(currentChat); };
 
 // ---------- ЗВОНКИ ----------
 window.makeCall = async (video, targetUser = null) => {
-  if (!targetUser) targetUser = prompt('Имя пользователя для звонка');
+  if (!targetUser) targetUser = prompt('Имя пользователя');
   if (!targetUser) return;
   await setupCall(targetUser, video);
 };
@@ -504,9 +499,12 @@ window.openSettings = () => {
       <div class="settings-tile" onclick="openCategory('chats')"><i class="fas fa-comments"></i><span>Чаты</span></div>
       <div class="settings-tile" onclick="openCategory('media')"><i class="fas fa-photo-video"></i><span>Медиа</span></div>
       <div class="settings-tile" onclick="openCategory('account')"><i class="fas fa-user-circle"></i><span>Аккаунт</span></div>
-      <div class="settings-tile" onclick="openCategory('about')"><i class="fas fa-info-circle"></i><span>О приложении</span></div>
     </div>
     <input type="text" placeholder="Поиск в настройках..." oninput="searchSettings(this.value)" style="width:100%;padding:12px;border-radius:30px;border:1px solid var(--border-light);margin:16px 0;">
+    <div class="lang-switch">
+      <div class="lang-btn active" onclick="setLanguage('ru')">🇷🇺 Русский</div>
+      <div class="lang-btn" onclick="setLanguage('en')">🇬🇧 English</div>
+    </div>
     <button class="btn" onclick="logout()">Выйти</button>
   `;
   document.getElementById('slidePanel').classList.add('active');
@@ -517,7 +515,7 @@ window.openCategory = (cat) => {
   if (cat === 'appearance') {
     html = `<h3>Тема</h3><select id="themeSelect" onchange="setTheme(this.value)"><option>light</option><option>dark</option></select>
             <h3>Акцент</h3><div>${['#8B5CF6','#F97316','#0EA5E9'].map(c => `<div class="color-dot" style="background:${c}" onclick="setAccent('${c}')"></div>`).join('')}</div>
-            <h3>Размер шрифта</h3><input type="range" min="14" max="22" onchange="document.body.style.fontSize=this.value+'px'">
+            <h3>Размер шрифта</h3><input type="range" min="14" max="22" onchange="document.body.style.fontSize=this.value+'px'; saveSetting('fontSize',this.value)">
             <h3>Фон чата</h3><input type="file" accept="image/*,video/*" onchange="setChatBg(this.files[0])">`;
   } else if (cat === 'notifications') {
     html = `<h3>Звук сообщений</h3><select>${messageSounds.map(s=>`<option>${s}</option>`).join('')}</select>
@@ -531,8 +529,10 @@ window.openCategory = (cat) => {
 window.setTheme = (t) => { document.documentElement.setAttribute('data-theme', t); saveSetting('theme', t); };
 window.setAccent = (c) => { document.documentElement.style.setProperty('--primary-gradient', `linear-gradient(135deg, ${c} 0%, #6D28D9 100%)`); saveSetting('accent', c); };
 window.closeSlidePanel = () => document.getElementById('slidePanel').classList.remove('active');
+window.setLanguage = (lang) => { currentLanguage = lang; applyLanguage(); saveSetting('language', lang); };
+function applyLanguage() { /* базовая локализация */ }
 
-// ---------- ПРОФИЛЬ И QR ----------
+// ---------- ПРОФИЛЬ ----------
 window.openProfile = () => {
   document.getElementById('panelTitle').innerText = 'Профиль';
   document.getElementById('panelContent').innerHTML = `
@@ -558,7 +558,7 @@ window.closeQR = () => {
   document.getElementById('qrcode').innerHTML = '';
 };
 
-// ---------- ЗАМЕТКИ, PAINT, МЕДИА ----------
+// ---------- ИНСТРУМЕНТЫ ----------
 window.openNotes = () => {
   const cont = document.getElementById('tabContent');
   cont.innerHTML = `<div class="content-header"><i class="fas fa-arrow-left" onclick="switchTab('tools')"></i><h2>Заметки</h2><i class="fas fa-plus" onclick="addNote()"></i></div><div class="list-container" id="notesList"></div>`;
@@ -608,56 +608,24 @@ window.savePaint = () => {
   a.download = 'paint.png';
   a.click();
 };
-window.openMedia = () => alert('Медиа-менеджер: управление файлами и кэшем');
+window.openMedia = () => alert('Медиа-менеджер');
 
-// ---------- ИИ (WebLLM) ----------
-async function initLLM() {
-  if (llmReady) return true;
-  try { llmEngine = await webllm.CreateMLCEngine("SmolLM2-1.7B-Instruct"); llmReady = true; return true; } catch { return false; }
-}
-async function askLLM(prompt) {
-  if (!llmReady) await initLLM();
-  if (!llmReady) return 'ИИ не загружен.';
-  const sys = 'Ты MIM Ассистент. Отвечай кратко на русском. Знаешь про канал MIDBED.';
-  const messages = [{ role: 'system', content: sys }, { role: 'user', content: prompt }];
-  try {
-    const reply = await llmEngine.chat.completions.create({ messages, temperature: 0.7, max_tokens: 200 });
-    return reply.choices[0].message.content;
-  } catch { return 'Ошибка.'; }
-}
+// ---------- ИИ ----------
+async function initLLM() { if (llmReady) return true; try { llmEngine = await webllm.CreateMLCEngine("SmolLM2-1.7B-Instruct"); llmReady = true; return true; } catch { return false; } }
+async function askLLM(prompt) { if (!llmReady) await initLLM(); if (!llmReady) return 'ИИ не загружен.'; const sys = 'Ты MIM Ассистент.'; const messages = [{ role: 'system', content: sys }, { role: 'user', content: prompt }]; try { const reply = await llmEngine.chat.completions.create({ messages, temperature: 0.7, max_tokens: 200 }); return reply.choices[0].message.content; } catch { return 'Ошибка.'; } }
 
-// Вспомогательные функции
+// Вспомогательные
 function updateChatLastMessage(chatId, message) {
   const chat = chats.find(c => c.id === chatId);
-  if (chat) {
-    chat.lastMsg = message.text?.substring(0, 30) || (message.file ? '📎 Файл' : '');
-    chat.time = new Date(message.timestamp).toLocaleTimeString().slice(0,5);
-    if (currentTab === 'chats') renderChats();
-  }
+  if (chat) { chat.lastMsg = message.text?.substring(0,30) || '📎'; chat.time = new Date(message.timestamp).toLocaleTimeString().slice(0,5); if (currentTab==='chats') renderChats(); }
 }
-window.cancelReply = () => { replyingTo = null; openChat(currentChat); };
-window.searchMessages = () => alert('Глобальный поиск сообщений');
+window.searchMessages = () => alert('Поиск');
 window.searchInChat = () => alert('Поиск в чате');
-window.showChatMenu = (e, chatId) => {
-  e.preventDefault();
-  const menu = document.createElement('div');
-  menu.className = 'context-menu';
-  menu.style.top = e.clientY + 'px';
-  menu.style.left = e.clientX + 'px';
-  menu.innerHTML = `
-    <div onclick="pinChat('${chatId}')"><i class="fas fa-thumbtack"></i> Закрепить</div>
-    <div onclick="archiveChat('${chatId}')"><i class="fas fa-archive"></i> Архивировать</div>
-    <div onclick="deleteChat('${chatId}')"><i class="fas fa-trash"></i> Удалить</div>
-  `;
-  document.body.appendChild(menu);
-  setTimeout(() => menu.remove(), 3000);
-};
-window.pinChat = (id) => { /* реализация */ };
-window.createGroup = () => alert('Создание группы');
+window.showChatMenu = (e, chatId) => { /* контекстное меню чата */ };
+window.createGroup = () => alert('Создание группы — модуль будет добавлен');
 window.addContact = () => alert('Добавление контакта');
 window.searchContacts = () => alert('Поиск контактов');
-window.openCalculator = () => alert('Калькулятор');
-window.openWeather = () => alert('Погода');
 window.openEmojiPicker = () => alert('Эмодзи');
 window.setChatBg = (file) => { if(file) alert('Фон установлен'); };
-window.searchSettings = (q) => { /* фильтрация */ };
+window.searchSettings = (q) => {};
+window.editProfile = () => alert('Редактирование профиля');
